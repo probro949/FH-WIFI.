@@ -16,17 +16,20 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Extract project
+        shell: bash
         run: |
           set -e
           ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+
           if [ -z "$ZIP_FILE" ]; then
-            echo "No ZIP file found"
+            echo "ERROR: ZIP project file not found"
             exit 1
           fi
+
           mkdir -p project
           unzip -o "$ZIP_FILE" -d project
 
@@ -37,37 +40,155 @@ jobs:
           java-version: '17'
 
       - name: Install Android SDK
+        shell: bash
         run: |
           set -e
           SDK="$ANDROID_SDK_ROOT"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses || true
-          "$SDKMANAGER" "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
-      - name: Find project
-        run: |
-          set -e
-          SETTINGS=$(find project -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1)
-          if [ -z "$SETTINGS" ]; then
-            echo "Android project not found"
-            find project -maxdepth 4 -type f | head -80
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+
+          SDKMANAGER="$SDK/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER=$(find "$SDK/cmdline-tools" -name sdkmanager -type f | head -n 1)
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
+            echo "ERROR: sdkmanager not found"
             exit 1
           fi
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+
+      - name: Find Android project
+        shell: bash
+        run: |
+          set -e
+
+          SETTINGS=$(find project -type f \( -name settings.gradle -o -name settings.gradle.kts \) | head -n 1)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "ERROR: Android project not found"
+            find project -maxdepth 5 -type f | head -100
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Project found: $PROJECT_DIR"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
+      - name: Fix Java and Kotlin JVM targets
+        shell: bash
+        run: |
+          set -e
+
+          FILE="$PROJECT_DIR/app/build.gradle"
+
+          if [ ! -f "$FILE" ]; then
+            FILE="$PROJECT_DIR/app/build.gradle.kts"
+          fi
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: app/build.gradle not found"
+            exit 1
+          fi
+
+          echo "Fixing JVM targets in $FILE"
+
+          python3 - "$FILE" <<'PY'
+          import sys
+          import re
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          content = path.read_text()
+
+          java_block = """
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          """
+
+          if re.search(r'compileOptions\s*\{', content):
+              content = re.sub(
+                  r'compileOptions\s*\{[^}]*\}',
+                  java_block.strip(),
+                  content,
+                  count=1,
+                  flags=re.S
+              )
+          else:
+              match = re.search(r'android\s*\{', content)
+              if not match:
+                  raise SystemExit("ERROR: android block not found")
+              content = (
+                  content[:match.end()]
+                  + "\n"
+                  + java_block
+                  + content[match.end():]
+              )
+
+          kotlin_block = """
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          """
+
+          if re.search(r'kotlinOptions\s*\{', content):
+              content = re.sub(
+                  r'kotlinOptions\s*\{[^}]*\}',
+                  kotlin_block.strip(),
+                  content,
+                  count=1,
+                  flags=re.S
+              )
+          else:
+              match = re.search(r'android\s*\{', content)
+              content = (
+                  content[:match.end()]
+                  + "\n"
+                  + kotlin_block
+                  + content[match.end():]
+              )
+
+          path.write_text(content)
+          print("Java and Kotlin targets set to 17")
+          PY
+
       - name: Build APK
         run: gradle -p "$PROJECT_DIR" assembleDebug
 
-      - name: Upload APK
+      - name: Find APK
+        shell: bash
+        run: |
+          set -e
+
+          APK=$(find "$PROJECT_DIR" -type f -path "*/outputs/apk/debug/*.apk" | head -n 1)
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: APK was not generated"
+            exit 1
+          fi
+
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
+          echo "APK found: $APK"
+
+      - name: Upload FH WIFI APK
         uses: actions/upload-artifact@v4
         with:
           name: FH-WIFI-APK
-          path: project/**/build/outputs/apk/debug/*.apk
+          path: ${{ env.APK_PATH }}
           if-no-files-found: error
           retention-days: 7
